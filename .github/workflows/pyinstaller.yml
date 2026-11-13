@@ -1,0 +1,172 @@
+name: Package exe with PyInstaller - Windows
+
+on:
+  push:
+    branches: [main, dev]
+  release:
+    types: [published]
+  # Until now a broken build only showed up after a push to main, which is how
+  # the Wine image could rot unnoticed for days. The release steps below are
+  # gated on push/release, so a pull request builds and tests and nothing else.
+  pull_request:
+    paths:
+      - '.github/workflows/pyinstaller.yml'
+      - 'pyinstaller/**'
+
+# Two builds racing on the same branch could leave the nightly tag pointing at
+# one commit while the .exe attached to the release was built from the other.
+concurrency:
+  group: pyinstaller-${{ github.ref }}
+  cancel-in-progress: true
+
+# Needed by "Move the nightly tag to the built commit" below, which force-updates
+# a ref under refs/tags/.
+permissions:
+  contents: write
+
+env:
+  # Deliberately prefixed. A tag named after the branch it was built from shadows
+  # that branch, and a bare `main` then resolves to the tag in every clone:
+  # `git rev-parse main` warns "refname 'main' is ambiguous" and answers with the
+  # tag, not the branch head.
+  NIGHTLY_TAG: nightly-${{ github.ref_name }}
+
+jobs:
+  build:
+    # A real Windows runner, not Wine. The old setup built inside a third-party
+    # action carrying an Ubuntu 18.04 + Wine image, and it died the moment
+    # ubuntu-latest moved to Ubuntu 26.04: `winetricks -q vcrun2019` answers
+    # "wine: socket : Function not implemented" and the image never builds.
+    # Nothing in that action had changed since March 2025, which is the point:
+    # the build depended on an environment nobody maintains.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # maigret comes from the checkout, not from a zip of main, so the exe
+      # matches the commit being built.
+      - name: Install build dependencies
+        run: |
+          pip install ".[pdf]"
+          pip install -r pyinstaller/requirements.txt
+
+      - name: PyInstaller Windows Build
+        working-directory: pyinstaller
+        run: pyinstaller --clean --noconfirm maigret_standalone.spec
+
+      # A onefile build that misses a hidden import still produces an .exe, and
+      # the gap shows up only when a user runs it. --help exercises the import
+      # chain; the real search then exercises what is imported lazily, which is
+      # where PyInstaller actually loses things (report writers above all).
+      #
+      # pwsh only fails a step on the exit code of its last command, so every
+      # call is checked by hand.
+      - name: Smoke-test the binary
+        run: |
+          .\pyinstaller\dist\maigret_standalone.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "--help exited with $LASTEXITCODE" }
+
+          .\pyinstaller\dist\maigret_standalone.exe soxoj --site GitHub --no-recursion --timeout 30 -H -X -P
+          if ($LASTEXITCODE -ne 0) { throw "search exited with $LASTEXITCODE" }
+
+          Get-ChildItem reports
+          if (-not (Get-ChildItem reports -Filter *.html -ErrorAction SilentlyContinue)) {
+            throw 'no HTML report was written'
+          }
+          if (-not (Get-ChildItem reports -Filter *.xmind -ErrorAction SilentlyContinue)) {
+            throw 'no XMind report was written'
+          }
+          if (-not (Get-ChildItem reports -Filter *.pdf -ErrorAction SilentlyContinue)) {
+            throw 'no PDF report was written'
+          }
+
+      - name: Upload PyInstaller Binary to Workflow as Artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: maigret_standalone_win64
+          path: pyinstaller/dist/maigret_standalone.exe
+
+      # release-action creates a tag only when it does not exist yet, and GitHub
+      # ignores target_commitish once the tag is there ("Unused if the Git tag
+      # already exists"). So the tag has to be moved here, otherwise it stays
+      # pinned to the first build forever while the attached .exe keeps being
+      # replaced on every push.
+      - name: Move the nightly tag to the built commit
+        if: success() && github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag --force "$NIGHTLY_TAG" "$GITHUB_SHA"
+          # Tag pushes do not match `on.push.branches`, and pushes authenticated
+          # with GITHUB_TOKEN never start a workflow run, so this cannot recurse.
+          git push --force origin "refs/tags/$NIGHTLY_TAG"
+
+      - name: Create New Release and Upload PyInstaller Binary to Release
+        if: success() && github.event_name == 'push'
+        uses: ncipollo/release-action@v1.14.0
+        id: create_release
+        with:
+          allowUpdates: true
+          draft: false
+          # A development build must never outrank a stable release. `prerelease`
+          # keeps it out of /releases/latest, and `makeLatest: false` stops it
+          # from stealing the marker back on the next push to main.
+          prerelease: true
+          artifactErrorsFailBuild: true
+          makeLatest: false
+          replacesArtifacts: true
+          artifacts: pyinstaller/dist/maigret_standalone.exe
+          name: Development Windows Release [${{ github.ref_name }}]
+          tag: ${{ env.NIGHTLY_TAG }}
+          commit: ${{ github.sha }}
+          body: |
+            This is a development release built from the **${{ github.ref_name }}** branch, at commit ${{ github.sha }}.
+            The `${{ env.NIGHTLY_TAG }}` tag is moved to that commit on every build, so it always matches the binary attached below.
+
+            It is **not** a stable release — for that, see [the latest release](https://github.com/soxoj/maigret/releases/latest).
+            ${{ github.ref_name == 'dev' && 'The `dev` branch is more experimental than `main`. Unless you need a specific unreleased fix, prefer [the `main` development build](https://github.com/soxoj/maigret/releases/tag/nightly-main).' || '' }}
+
+            ## How to run
+
+            1. Download the attached `maigret_standalone.exe`.
+            2. Either:
+               - **Double-click it** — Maigret will ask you for a username, run a default search, and pause at the end so the output stays visible.
+               - **Run it from a terminal** for full options. Press `Win+R`, type `cmd`, hit Enter (or open PowerShell), then:
+
+                 ```cmd
+                 cd %USERPROFILE%\Downloads
+                 maigret_standalone.exe USERNAME
+                 maigret_standalone.exe USERNAME --html       :: also save an HTML report
+                 maigret_standalone.exe --help                :: list all options
+                 ```
+
+            Video guide: https://youtu.be/qIgwTZOmMmM
+            Full documentation: https://maigret.readthedocs.io/en/latest/
+
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # A published release already has its title, notes and prerelease flag set
+      # by whoever published it. release-action would overwrite all three with its
+      # own defaults during an update, so every omit*DuringUpdate is on: this step
+      # attaches the binary and touches nothing else.
+      - name: Attach the binary to the published release
+        if: success() && github.event_name == 'release'
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          allowUpdates: true
+          omitNameDuringUpdate: true
+          omitBodyDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          omitDraftDuringUpdate: true
+          artifactErrorsFailBuild: true
+          replacesArtifacts: true
+          artifacts: pyinstaller/dist/maigret_standalone.exe
+          tag: ${{ github.event.release.tag_name }}

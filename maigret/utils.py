@@ -1,12 +1,63 @@
+# coding: utf8
 import ast
 import difflib
 import re
 import random
-from typing import Any
+import string
+import sys
+from typing import Any, List, Optional, Tuple
+
+from markupsafe import Markup, escape
+
+
+def read_input_file(
+    path: str, supported_ids: Tuple[str, ...]
+) -> List[Tuple[str, Optional[str]]]:
+    """Read identifiers from a file, one per line; '-' means stdin.
+
+    A line is either a bare value, or ``id_type:value`` where the prefix is one
+    of the supported id types. Blank lines and lines starting with # are
+    skipped. Bare values get their type from --id-type, resolved by the caller,
+    and duplicates are left alone: they collapse in the caller's dict anyway.
+    """
+    if path == '-':
+        text = sys.stdin.read()
+    else:
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+
+    text = text.removeprefix("\ufeff")
+
+    entries: List[Tuple[str, Optional[str]]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        prefix, separator, value = line.partition(':')
+        value = value.strip()
+        if separator and value and prefix in supported_ids:
+            entries.append((value, prefix))
+            continue
+
+        # A prefix that almost spells an id type is a typo, not a value. Values
+        # with a colon in them (URLs and the like) are far enough from every
+        # supported type that they stay silent.
+        if separator and difflib.get_close_matches(
+            prefix, supported_ids, n=1, cutoff=0.8
+        ):
+            print(
+                f"Unknown id type '{prefix}', taking the whole line as a value: {line}",
+                file=sys.stderr,
+            )
+
+        entries.append((line, None))
+
+    return entries
 
 
 DEFAULT_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
 ]
 
 
@@ -36,14 +87,17 @@ def is_country_tag(tag: str) -> bool:
 def enrich_link_str(link: str) -> str:
     link = link.strip()
     if link.startswith("www.") or (link.startswith("http") and "//" in link):
-        return f'<a class="auto-link" href="{link}">{link}</a>'
+        # escape the link to avoid XSS; Markup keeps the <a> tag itself intact
+        # under the template's autoescaping.
+        safe = escape(link)
+        return Markup(f'<a class="auto-link" href="{safe}">{safe}</a>')
     return link
 
 
 class URLMatcher:
-    _HTTP_URL_RE_STR = "^https?://(www.)?(.+)$"
+    _HTTP_URL_RE_STR = r"^https?://(www\.|m\.)?(.+)$"
     HTTP_URL_RE = re.compile(_HTTP_URL_RE_STR)
-    UNSAFE_SYMBOLS = ".?"
+    USERNAME_GROUP = "_maigret_username"
 
     @classmethod
     def extract_main_part(self, url: str) -> str:
@@ -56,32 +110,50 @@ class URLMatcher:
     @classmethod
     def make_profile_url_regexp(self, url: str, username_regexp: str = ""):
         url_main_part = self.extract_main_part(url)
-        for c in self.UNSAFE_SYMBOLS:
-            url_main_part = url_main_part.replace(c, f"\\{c}")
         prepared_username_regexp = (username_regexp or ".+?").lstrip('^').rstrip('$')
 
-        url_regexp = url_main_part.replace(
-            "{username}", f"({prepared_username_regexp})"
+        url_regexp = f"({prepared_username_regexp})".join(
+            re.escape(part) for part in url_main_part.split("{username}")
         )
-        regexp_str = self._HTTP_URL_RE_STR.replace("(.+)", url_regexp)
+        url_regexp = url_regexp.replace(
+            f"({prepared_username_regexp})",
+            f"(?P<{self.USERNAME_GROUP}>{prepared_username_regexp})",
+            1,
+        )
+        # A profile link often carries a trailing slash, a query string or a
+        # fragment (``/alice/``, ``/alice?tab=repos``); allow them after the
+        # username so they neither break a username regexp nor end up in it.
+        regexp_str = self._HTTP_URL_RE_STR.replace(
+            "(.+)$", url_regexp + r"/?(?:[?#].*)?$"
+        )
 
-        return re.compile(regexp_str)
+        return re.compile(regexp_str, re.IGNORECASE)
 
 
 def ascii_data_display(data: str) -> Any:
-    return ast.literal_eval(data)
+    try:
+        return ast.literal_eval(data)
+    except (ValueError, SyntaxError):
+        return data
 
 
 def get_dict_ascii_tree(items, prepend="", new_line=True):
+    new_result = b'\xe2\x94\x9c'.decode()
+    h_line = b'\xe2\x94\x80'.decode()
+    last_result = b'\xe2\x94\x94'.decode()
+    skip_result = b'\xe2\x94\x82'.decode()
+
     text = ""
     for num, item in enumerate(items):
-        box_symbol = "┣╸" if num != len(items) - 1 else "┗╸"
+        box_symbol = (
+            new_result + h_line if num != len(items) - 1 else last_result + h_line
+        )
 
-        if type(item) == tuple:
+        if isinstance(item, tuple):
             field_name, field_value = item
-            if field_value.startswith("['"):
+            if isinstance(field_value, str) and field_value.startswith("['"):
                 is_last_item = num == len(items) - 1
-                prepend_symbols = " " * 3 if is_last_item else " ┃ "
+                prepend_symbols = " " * 3 if is_last_item else f" {skip_result} "
                 data = ascii_data_display(field_value)
                 field_value = get_dict_ascii_tree(data, prepend_symbols)
             text += f"\n{prepend}{box_symbol}{field_name}: {field_value}"
@@ -111,3 +183,69 @@ def get_match_ratio(base_strs: list):
         )
 
     return get_match_inner
+
+
+def generate_random_username():
+    return ''.join(random.choices(string.ascii_lowercase, k=10))
+
+
+def is_plausible_username(value: Any) -> bool:
+    """Reject obviously non-username strings extracted from sites' identity data.
+
+    Extractor schemes occasionally populate fields named like ``*_username``
+    with URLs (e.g. ``instagram_username`` -> ``https://instagram.com/X``) or
+    emails (e.g. ``your_username`` -> ``user@example.com``). Feeding such a
+    value back into a site URL template produces broken requests on every
+    subsequent site, which manifests as a cascade of false errors and the
+    "wrong username" symptom in #1403.
+    """
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    if "://" in s or s.startswith(("http://", "https://", "www.", "//")):
+        return False
+    if "/" in s:
+        return False
+    if any(c.isspace() for c in s):
+        return False
+    if "@" in s and "." in s:
+        return False
+    return True
+
+
+def extract_usernames(info, logger):
+    """Extract plausible usernames from socid_extractor results.
+
+    Supports single username fields (e.g. ``profile_username``) and
+    serialized username lists (e.g. ``other_usernames``). Invalid values
+    such as URLs or emails are rejected via ``is_plausible_username``.
+    """
+    results = []
+
+    for key, value in info.items():
+        if "username" in key and "usernames" not in key:
+            if is_plausible_username(value):
+                results.append(value)
+            else:
+                logger.debug(
+                    f"Rejected non-username value extracted "
+                    f"under key {key!r}: {value!r}"
+                )
+        elif "usernames" in key:
+            try:
+                parsed = ast.literal_eval(value)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if is_plausible_username(item):
+                            results.append(item)
+                        else:
+                            logger.debug(
+                                f"Rejected non-username item "
+                                f"from list under key {key!r}: {item!r}"
+                            )
+            except Exception as e:
+                logger.warning(e)
+
+    return results

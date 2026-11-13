@@ -1,21 +1,31 @@
 import ast
 import csv
+import html
 import io
+import ipaddress
 import json
 import logging
 import os
+import socket
+import tempfile
+import zipfile
 from datetime import datetime
 from typing import Dict, Any
+from urllib.parse import urlparse
+from xml.etree import ElementTree
 
-import xmind
+import xmind  # type: ignore[import-untyped]
+from dateutil.tz import gettz
 from dateutil.parser import parse as parse_datetime_str
 from jinja2 import Template
 
 from .checking import SUPPORTED_IDS
-from .result import QueryStatus
+from .result import MaigretCheckStatus
 from .sites import MaigretDatabase
 from .utils import is_country_tag, CaseConverter, enrich_link_str
 
+
+ADDITIONAL_TZINFO = {"CDT": gettz("America/Chicago")}
 SUPPORTED_JSON_REPORT_FORMATS = [
     "simple",
     "ndjson",
@@ -27,14 +37,18 @@ UTILS
 
 
 def filter_supposed_data(data):
-    # interesting fields
     allowed_fields = ["fullname", "gender", "location", "age"]
-    filtered_supposed_data = {
-        CaseConverter.snake_to_title(k): v[0]
+
+    def _first(v):
+        if isinstance(v, (list, tuple)):
+            return v[0] if v else ""
+        return v
+
+    return {
+        CaseConverter.snake_to_title(k): _first(v)
         for k, v in data.items()
         if k in allowed_fields
     }
-    return filtered_supposed_data
 
 
 def sort_report_by_data_points(results):
@@ -67,19 +81,94 @@ def save_txt_report(filename: str, username: str, results: dict):
 def save_html_report(filename: str, context: dict):
     template, _ = generate_report_template(is_pdf=False)
     filled_template = template.render(**context)
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         f.write(filled_template)
 
 
+PDF_EXTRA_HINT = (
+    "PDF reports require the optional 'pdf' extra. "
+    "Install it with: pip install 'maigret[pdf]'"
+)
+
+# 1x1 transparent PNG substituted for any report image URL that isn't a safe
+# public http(s) resource (see _is_safe_report_image_url).
+_BLANK_IMAGE_PATH = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "resources", "blank.png"
+)
+
+
+def _is_safe_report_image_url(uri) -> bool:
+    """Whether ``uri`` is a public http(s) image safe to fetch during PDF render.
+
+    Report images come from scraped profile data (``ids_data['image']``), which
+    is attacker-influenced. xhtml2pdf resolves ``<img src>`` while building the
+    PDF, so an intranet or cloud-metadata URL is a request made by the machine
+    running maigret (server-side in the web UI). A src with no scheme at all is
+    worse than a URL: xhtml2pdf falls back to treating it as a local path and
+    opens it. Only allow http(s) hosts that resolve to public addresses.
+    """
+    if not isinstance(uri, str):
+        return False
+    parsed = urlparse(uri.strip())
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
+        # is_global is False for private, loopback, link-local, unspecified and
+        # CGNAT (100.64.0.0/10) addresses. Multicast and reserved ranges are
+        # still is_global on CPython, so they stay explicit: 64:ff9b::/96 is
+        # reserved but routes to IPv4 through a NAT64 gateway.
+        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+            return False
+    return True
+
+
+def _pdf_report_link_callback(uri, rel):
+    """xhtml2pdf resource resolver: let safe public images through, and divert
+    everything else to a local blank placeholder so no fetch/read happens.
+
+    Returning a local path (rather than raising) keeps report generation working
+    even when a scanned profile carries a hostile image URL — a raise would abort
+    the whole PDF.
+    """
+    if _is_safe_report_image_url(uri):
+        return uri
+    return _BLANK_IMAGE_PATH
+
+
 def save_pdf_report(filename: str, context: dict):
+    # Imported lazily so that users without the optional 'pdf' extra
+    # can still import maigret.report and use other report formats.
+    try:
+        from xhtml2pdf import pisa  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(PDF_EXTRA_HINT) from e
+
     template, css = generate_report_template(is_pdf=True)
     filled_template = template.render(**context)
 
-    # moved here to speed up the launch of Maigret
-    from xhtml2pdf import pisa
-
     with open(filename, "w+b") as f:
-        pisa.pisaDocument(io.StringIO(filled_template), dest=f, default_css=css)
+        pisa.pisaDocument(
+            io.StringIO(filled_template),
+            dest=f,
+            default_css=css,
+            link_callback=_pdf_report_link_callback,
+        )
 
 
 def save_json_report(filename: str, username: str, results: dict, report_type: str):
@@ -87,129 +176,303 @@ def save_json_report(filename: str, username: str, results: dict, report_type: s
         generate_json_report(username, results, f, report_type=report_type)
 
 
+GRAPH_VISUAL_OPTIONS = {
+    'interaction': {
+        'hover': True,
+        'navigationButtons': True,
+        'keyboard': {'enabled': True},
+    },
+    'nodes': {
+        'borderWidth': 2,
+        'font': {'color': '#e2e8f0', 'face': 'Arial', 'size': 14},
+    },
+    'edges': {
+        'color': {
+            'color': '#64748b',
+            'highlight': '#f8fafc',
+            'hover': '#cbd5e1',
+            'inherit': False,
+        },
+        'smooth': False,
+    },
+    'groups': {
+        'identity': {
+            'color': {'background': '#7c3aed', 'border': '#c4b5fd'},
+        },
+        'account': {
+            'color': {'background': '#d97706', 'border': '#fcd34d'},
+        },
+        'site': {
+            'color': {'background': '#059669', 'border': '#6ee7b7'},
+        },
+        'metadata': {
+            'color': {'background': '#2563eb', 'border': '#93c5fd'},
+        },
+    },
+    'physics': {
+        'stabilization': {
+            'enabled': True,
+            'iterations': 200,
+            'updateInterval': 25,
+            'fit': True,
+        },
+    },
+}
+
+
 class MaigretGraph:
-    other_params = {'size': 10, 'group': 3}
-    site_params = {'size': 15, 'group': 2}
-    username_params = {'size': 20, 'group': 1}
+    max_label_length = 48
+    other_params: dict = {'size': 10, 'group': 'metadata'}
+    site_params: dict = {'size': 15, 'group': 'site'}
+    account_params: dict = {'size': 15, 'group': 'account'}
+    username_params: dict = {'size': 20, 'group': 'identity'}
 
     def __init__(self, graph):
         self.G = graph
 
     def add_node(self, key, value):
-        node_name = f'{key}: {value}'
+        value_text = str(value)
+        node_name = f'{key}: {value_text}'
 
-        params = self.other_params
+        params = dict(self.other_params)
         if key in SUPPORTED_IDS:
-            params = self.username_params
-        elif value.startswith('http'):
-            params = self.site_params
+            params = dict(self.username_params)
+        elif key == 'site':
+            params = dict(self.site_params)
+        elif key == 'account':
+            params = dict(self.account_params)
 
-        self.G.add_node(node_name, title=node_name, **params)
+        params['label'] = (
+            node_name
+            if len(node_name) <= self.max_label_length
+            else f'{node_name[: self.max_label_length - 3]}...'
+        )
+        params['title'] = f'<b>{html.escape(str(key))}</b><br>{html.escape(value_text)}'
 
-        if value != value.lower():
-            normalized_node_name = self.add_node(key, value.lower())
-            self.link(node_name, normalized_node_name)
-
+        self.G.add_node(node_name, **params)
         return node_name
 
-    def link(self, node1_name, node2_name):
-        self.G.add_edge(node1_name, node2_name, weight=2)
+    def link(self, node1_name, node2_name, title):
+        self.G.add_edge(node1_name, node2_name, weight=2, title=title)
 
 
-def save_graph_report(filename: str, username_results: list, db: MaigretDatabase):
-    # moved here to speed up the launch of Maigret
+def _build_maigret_graph(username_results: list, db: MaigretDatabase):
     import networkx as nx
 
-    G = nx.Graph()
+    G: Any = nx.Graph()
     graph = MaigretGraph(G)
 
+    base_site_nodes = {}
+    site_account_nodes = {}
+    processed_values: Dict[str, Any] = {}  # Track processed values to avoid duplicates
+
     for username, id_type, results in username_results:
-        username_node_name = graph.add_node(id_type, username)
+        # Add username node, using normalized version directly if different
+        norm_username = username.lower()
+        username_node_name = graph.add_node(id_type, norm_username)
 
-        for website_name in results:
-            dictionary = results[website_name]
-            # TODO: fix no site data issue
-            if not dictionary:
-                continue
-
+        for website_name, dictionary in results.items():
             if dictionary.get("is_similar"):
                 continue
 
             status = dictionary.get("status")
-            if not status:  # FIXME: currently in case of timeout
+            if not status or status.status != MaigretCheckStatus.CLAIMED:
                 continue
 
-            if dictionary["status"].status != QueryStatus.CLAIMED:
-                continue
+            # base site node
+            site_base_url = website_name
+            if site_base_url not in base_site_nodes:
+                base_site_nodes[site_base_url] = graph.add_node('site', site_base_url)
 
-            site_fallback_name = dictionary.get(
-                'url_user', f'{website_name}: {username.lower()}'
-            )
-            # site_node_name = dictionary.get('url_user', f'{website_name}: {username.lower()}')
-            site_node_name = graph.add_node('site', site_fallback_name)
-            graph.link(username_node_name, site_node_name)
+            site_base_node_name = base_site_nodes[site_base_url]
+
+            # account node
+            account_url = dictionary.get('url_user', f'{site_base_url}/{norm_username}')
+            account_node_id = f"{site_base_url}: {account_url}"
+            if account_node_id not in site_account_nodes:
+                site_account_nodes[account_node_id] = graph.add_node(
+                    'account', account_url
+                )
+
+            account_node_name = site_account_nodes[account_node_id]
+
+            # link username → account → site
+            graph.link(username_node_name, account_node_name, 'Matched account')
+            graph.link(account_node_name, site_base_node_name, 'Hosted on site')
 
             def process_ids(parent_node, ids):
                 for k, v in ids.items():
-                    if k.endswith('_count') or k.startswith('is_') or k.endswith('_at'):
+                    if (
+                        k.endswith('_count')
+                        or k.startswith('is_')
+                        or k.endswith('_at')
+                        or k == 'image'
+                    ):
                         continue
-                    if k in 'image':
-                        continue
 
-                    v_data = v
-                    if v.startswith('['):
-                        try:
-                            v_data = ast.literal_eval(v)
-                        except Exception as e:
-                            logging.error(e)
+                    # Normalize value if string
+                    norm_v = v.lower() if isinstance(v, str) else v
+                    value_key = f"{k}:{norm_v}"
 
-                    # value is a list
-                    if isinstance(v_data, list):
-                        list_node_name = graph.add_node(k, site_fallback_name)
-                        for vv in v_data:
-                            data_node_name = graph.add_node(vv, site_fallback_name)
-                            graph.link(list_node_name, data_node_name)
-
-                            add_ids = {
-                                a: b for b, a in db.extract_ids_from_url(vv).items()
-                            }
-                            if add_ids:
-                                process_ids(data_node_name, add_ids)
+                    if value_key in processed_values:
+                        ids_data_name = processed_values[value_key]
                     else:
-                        # value is just a string
-                        # ids_data_name = f'{k}: {v}'
-                        # if ids_data_name == parent_node:
-                        #     continue
+                        v_data = v
+                        if isinstance(v, str) and v.startswith('['):
+                            try:
+                                v_data = ast.literal_eval(v)
+                            except Exception as e:
+                                logging.error(e)
+                                continue
 
-                        ids_data_name = graph.add_node(k, v)
-                        # G.add_node(ids_data_name, size=10, title=ids_data_name, group=3)
-                        graph.link(parent_node, ids_data_name)
+                        if isinstance(v_data, list):
+                            list_node_name = graph.add_node(k, site_base_url)
+                            processed_values[value_key] = list_node_name
+                            for vv in v_data:
+                                data_node_name = graph.add_node(vv, site_base_url)
+                                graph.link(
+                                    list_node_name, data_node_name, 'Extracted value'
+                                )
 
-                        # check for username
-                        if 'username' in k or k in SUPPORTED_IDS:
-                            new_username_node_name = graph.add_node('username', v)
-                            graph.link(ids_data_name, new_username_node_name)
+                                if isinstance(vv, str):
+                                    add_ids = {
+                                        a: b
+                                        for b, a in db.extract_ids_from_url(vv).items()
+                                    }
+                                    if add_ids:
+                                        process_ids(data_node_name, add_ids)
+                            ids_data_name = list_node_name
+                        else:
+                            ids_data_name = graph.add_node(k, norm_v)
+                            processed_values[value_key] = ids_data_name
 
-                        add_ids = {k: v for v, k in db.extract_ids_from_url(v).items()}
-                        if add_ids:
-                            process_ids(ids_data_name, add_ids)
+                            if 'username' in k or k in SUPPORTED_IDS:
+                                new_username_key = f"username:{norm_v}"
+                                if new_username_key not in processed_values:
+                                    new_username_node_name = graph.add_node(
+                                        'username', norm_v
+                                    )
+                                    processed_values[new_username_key] = (
+                                        new_username_node_name
+                                    )
+                                    graph.link(
+                                        ids_data_name,
+                                        new_username_node_name,
+                                        'Derived identifier',
+                                    )
+
+                            if isinstance(v, str):
+                                add_ids = {
+                                    k: v for v, k in db.extract_ids_from_url(v).items()
+                                }
+                                if add_ids:
+                                    process_ids(ids_data_name, add_ids)
+
+                    graph.link(parent_node, ids_data_name, 'Extracted profile data')
 
             if status.ids_data:
-                process_ids(site_node_name, status.ids_data)
+                process_ids(account_node_name, status.ids_data)
 
-    nodes_to_remove = []
-    for node in G.nodes:
-        if len(str(node)) > 100:
-            nodes_to_remove.append(node)
+    # Keep structural nodes addressable and shorten only their displayed labels.
+    # Large extracted values are still omitted to avoid cluttering the graph.
+    nodes_to_remove = [
+        node
+        for node, data in G.nodes(data=True)
+        if len(str(node)) > 100
+        and data.get('group') == 'metadata'
+        and G.degree(node) <= 1
+    ]
+    G.remove_nodes_from(nodes_to_remove)
 
-    [G.remove_node(node) for node in nodes_to_remove]
+    # Remove site nodes with only one connection
+    single_degree_sites = [
+        n for n, deg in G.degree() if n.startswith("site:") and deg <= 1
+    ]
+    G.remove_nodes_from(single_degree_sites)
 
-    # moved here to speed up the launch of Maigret
-    from pyvis.network import Network
+    return G
 
-    nt = Network(notebook=True, height="750px", width="100%")
+
+def save_graph_report(filename: str, username_results: list, db: MaigretDatabase):
+    G = _build_maigret_graph(username_results, db)
+
+    # Generate interactive visualization
+    from pyvis.network import Network  # type: ignore[import-untyped]
+
+    # cdn_resources="in_line": self-contained HTML, no lib/ folder written
+    # relative to the process cwd (pyvis's default "local" mode does that,
+    # which breaks when the report is served from a different directory).
+    nt = Network(
+        notebook=True,
+        height="100vh",
+        width="100%",
+        bgcolor="#0f172a",
+        font_color="#e2e8f0",
+        cdn_resources="in_line",
+    )
     nt.from_nx(G)
-    nt.show(filename)
+    nt.set_options(json.dumps(GRAPH_VISUAL_OPTIONS))
+    # Render and write the file here instead of calling nt.show(): pyvis opens
+    # the target with open(name, "w+"), i.e. the locale encoding, which on
+    # Windows is a non-UTF-8 codepage (cp1252 by default). The inlined
+    # vis-network bundle carries several hundred non-ASCII characters of its
+    # own, so the write failed with UnicodeEncodeError for every graph report,
+    # whatever was scanned. The template already declares a utf-8 charset.
+    graph_html = nt.generate_html(name=filename, notebook=True)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(graph_html)
+
+
+def _graph_to_cypher(G) -> str:
+    """Serialize a maigret networkx graph as an idempotent Cypher script.
+
+    Nodes are MERGEd on their unique ``name`` so re-importing the same report
+    does not create duplicate nodes; edges become ``[:LINKED_TO]`` relationships.
+    """
+
+    def cstr(value) -> str:
+        # Cypher single-quoted string literal, with escaping.
+        s = (
+            str(value)
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
+            .replace('\n', '\\n')
+            .replace('\r', '\\r')
+            .replace('\t', '\\t')
+        )
+        return "'" + s + "'"
+
+    lines = [
+        "// maigret Neo4j export. Import: cypher-shell -u neo4j -p <password> < <file>.cypher",
+        "CREATE CONSTRAINT maigret_node_name IF NOT EXISTS",
+        "FOR (n:MaigretNode) REQUIRE n.name IS UNIQUE;",
+        "",
+    ]
+    for node in G.nodes():
+        node_type, _, label = str(node).partition(':')
+        lines.append(
+            "MERGE (n:MaigretNode {name: %s}) SET n.type = %s, n.label = %s;"
+            % (cstr(node), cstr(node_type.strip()), cstr(label.strip()))
+        )
+    lines.append("")
+    for node1, node2 in G.edges():
+        lines.append(
+            "MATCH (a:MaigretNode {name: %s}), (b:MaigretNode {name: %s}) "
+            "MERGE (a)-[:LINKED_TO]->(b);" % (cstr(node1), cstr(node2))
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_neo4j_report(filename: str, username_results: list, db: MaigretDatabase):
+    """Save a Neo4j Cypher report of the maigret graph (see ``_graph_to_cypher``).
+
+    Load the resulting file with ``cypher-shell -u neo4j -p <password> < file``
+    or paste it into the Neo4j Browser.
+    """
+    G = _build_maigret_graph(username_results, db)
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(_graph_to_cypher(G))
 
 
 def get_plaintext_report(context: dict) -> str:
@@ -223,6 +486,149 @@ def get_plaintext_report(context: dict) -> str:
     return output.strip()
 
 
+def _md_format_value(value) -> str:
+    """Format a value for Markdown output, detecting links."""
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    s = str(value)
+    if s.startswith("http://") or s.startswith("https://"):
+        return f"[{s}]({s})"
+    return s
+
+
+def generate_markdown_report(context: dict, run_info: dict = None) -> str:
+    username = context.get("username", "unknown")
+    generated_at = context.get("generated_at", "")
+    brief = context.get("brief", "")
+    countries = context.get("countries_tuple_list", [])
+    interests = context.get("interests_tuple_list", [])
+    first_seen = context.get("first_seen")
+    results = context.get("results", [])
+
+    # Collect ALL values for key fields across all accounts
+    all_fields: Dict[str, list] = {}
+    last_seen = None
+    for _, _, data in results:
+        for _, v in data.items():
+            if not v.get("found") or v.get("is_similar"):
+                continue
+            ids_data = v.get("ids_data", {})
+            # Map multiple source fields to unified output fields
+            field_sources = {
+                "fullname": ("fullname", "name"),
+                "location": ("location", "country", "city", "country_code", "locale", "region"),
+                "gender": ("gender",),
+                "bio": ("bio", "about", "description"),
+            }
+            for out_field, source_keys in field_sources.items():
+                for src in source_keys:
+                    val = ids_data.get(src)
+                    if val:
+                        all_fields.setdefault(out_field, [])
+                        val_str = str(val)
+                        if val_str not in all_fields[out_field]:
+                            all_fields[out_field].append(val_str)
+            # Track last_seen
+            for ts_field in ("last_online", "latest_activity_at", "updated_at"):
+                ts = ids_data.get(ts_field)
+                if ts and (last_seen is None or str(ts) > str(last_seen)):
+                    last_seen = ts
+
+    lines = []
+    lines.append(f"# Report by searching on username \"{username}\"\n")
+
+    # Generated line with run info
+    gen_line = f"Generated at {generated_at} by [Maigret](https://github.com/soxoj/maigret)"
+    if run_info:
+        parts = []
+        if run_info.get("sites_count"):
+            parts.append(f"{run_info['sites_count']} sites checked")
+        if run_info.get("flags"):
+            parts.append(f"flags: `{run_info['flags']}`")
+        if parts:
+            gen_line += f" ({', '.join(parts)})"
+    lines.append(f"{gen_line}\n")
+
+    # Summary
+    lines.append("## Summary\n")
+    lines.append(f"{brief}\n")
+
+    if all_fields:
+        lines.append("**Information extracted from accounts:**\n")
+        for field, values in all_fields.items():
+            title = CaseConverter.snake_to_title(field)
+            lines.append(f"- {title}: {'; '.join(values)}")
+        lines.append("")
+
+    if countries:
+        geo = ", ".join(f"{code} (x{count})" for code, count in countries)
+        lines.append(f"**Country tags:** {geo}\n")
+
+    if interests:
+        tags = ", ".join(f"{tag} (x{count})" for tag, count in interests)
+        lines.append(f"**Website tags:** {tags}\n")
+
+    if first_seen:
+        lines.append(f"**First seen:** {first_seen}")
+    if last_seen:
+        lines.append(f"**Last seen:** {last_seen}")
+    if first_seen or last_seen:
+        lines.append("")
+
+    # Accounts found
+    lines.append("## Accounts found\n")
+
+    for u, id_type, data in results:
+        for site_name, v in data.items():
+            if not v.get("found") or v.get("is_similar"):
+                continue
+
+            lines.append(f"### {site_name}\n")
+            lines.append(f"- **URL:** [{v.get('url_user', '')}]({v.get('url_user', '')})")
+
+            tags = v.get("status") and v["status"].tags or []
+            if tags:
+                lines.append(f"- **Tags:** {', '.join(tags)}")
+                lines.append("")
+
+            ids_data = v.get("ids_data", {})
+            if ids_data:
+                for field, value in ids_data.items():
+                    if field == "image":
+                        continue
+                    title = CaseConverter.snake_to_title(field)
+                    lines.append(f"- {title}: {_md_format_value(value)}")
+
+            lines.append("")
+
+    # Possible false positives
+    lines.append("## Possible false positives\n")
+    lines.append(
+        f"This report was generated by searching for accounts matching the username `{username}`. "
+        f"Accounts listed above may belong to different people who happen to use the same "
+        f"or similar username. Results without extracted personal information could contain "
+        f"some false positive findings. Always verify findings before drawing conclusions.\n"
+    )
+
+    # Ethical use
+    lines.append("## Ethical use\n")
+    lines.append(
+        "This report is a result of a technical collection of publicly available information "
+        "from online accounts and does not constitute personal data processing. If you intend "
+        "to use this data for personal data processing or collection purposes, ensure your use "
+        "complies with applicable laws and regulations in your jurisdiction (such as GDPR, "
+        "CCPA, and similar).\n"
+    )
+
+    return "\n".join(lines)
+
+
+def save_markdown_report(filename: str, context: dict, run_info: dict = None):
+    content = generate_markdown_report(context, run_info)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 """
 REPORTS GENERATING
 """
@@ -234,7 +640,9 @@ def generate_report_template(is_pdf: bool):
     """
 
     def get_resource_content(filename):
-        return open(os.path.join(maigret_path, "resources", filename)).read()
+        path = os.path.join(maigret_path, "resources", filename)
+        with open(path, encoding="utf-8") as f:
+            return f.read()
 
     maigret_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -245,7 +653,9 @@ def generate_report_template(is_pdf: bool):
         template_content = get_resource_content("simple_report.tpl")
         css_content = None
 
-    template = Template(template_content)
+    # autoescape: report data comes from scanned profiles and must be escaped
+    # to avoid XSS in the generated report.
+    template = Template(template_content, autoescape=True)
     template.globals["title"] = CaseConverter.snake_to_title  # type: ignore
     template.globals["detect_link"] = enrich_link_str  # type: ignore
     return template, css_content
@@ -270,10 +680,6 @@ def generate_report_context(username_results: list):
 
         for website_name in results:
             dictionary = results[website_name]
-            # TODO: fix no site data issue
-            if not dictionary:
-                continue
-
             if dictionary.get("is_similar"):
                 continue
 
@@ -292,8 +698,12 @@ def generate_report_context(username_results: list):
                         first_seen = created_at
                     else:
                         try:
-                            known_time = parse_datetime_str(first_seen)
-                            new_time = parse_datetime_str(created_at)
+                            known_time = parse_datetime_str(
+                                first_seen, tzinfos=ADDITIONAL_TZINFO
+                            )
+                            new_time = parse_datetime_str(
+                                created_at, tzinfos=ADDITIONAL_TZINFO
+                            )
                             if new_time < known_time:
                                 first_seen = created_at
                         except Exception as e:
@@ -302,6 +712,7 @@ def generate_report_context(username_results: list):
                                 first_seen,
                                 created_at,
                                 str(e),
+                                exc_info=True,
                             )
 
                 for k, v in status.ids_data.items():
@@ -313,13 +724,13 @@ def generate_report_context(username_results: list):
                     # suppose country
                     if k in ["country", "locale"]:
                         try:
-                            if is_country_tag(k):
-                                tag = pycountry.countries.get(alpha_2=v).alpha_2.lower()
+                            if is_country_tag(v):
+                                country = pycountry.countries.get(alpha_2=v)
+                                tag = country.alpha_2.lower()  # type: ignore[union-attr]
                             else:
                                 tag = pycountry.countries.search_fuzzy(v)[
                                     0
-                                ].alpha_2.lower()
-                            # TODO: move countries to another struct
+                                ].alpha_2.lower()  # type: ignore[attr-defined]
                             tags[tag] = tags.get(tag, 0) + 1
                         except Exception as e:
                             logging.debug(
@@ -333,7 +744,7 @@ def generate_report_context(username_results: list):
                         new_ids.append((u, utype))
                         usernames[u] = {"type": utype}
 
-            if status.status == QueryStatus.CLAIMED:
+            if status.status == MaigretCheckStatus.CLAIMED:
                 found_accounts += 1
                 dictionary["found"] = True
             else:
@@ -371,7 +782,6 @@ def generate_report_context(username_results: list):
 
     return {
         "username": first_username,
-        # TODO: return brief list
         "brief": brief,
         "results": username_results,
         "first_seen": first_seen,
@@ -385,13 +795,22 @@ def generate_report_context(username_results: list):
 def generate_csv_report(username: str, results: dict, csvfile):
     writer = csv.writer(csvfile)
     writer.writerow(
-        ["username", "name", "url_main", "url_user", "exists", "http_status"]
+        [
+            "username",
+            "name",
+            "url_main",
+            "url_user",
+            "exists",
+            "http_status",
+            "error_reason",
+        ]
     )
     for site in results:
-        # TODO: fix the reason
         status = 'Unknown'
-        if "status" in results[site]:
-            status = str(results[site]["status"].status)
+        result_status = results[site].get("status")
+        error_reason = _get_result_error_reason(result_status)
+        if result_status:
+            status = str(result_status.status)
         writer.writerow(
             [
                 username,
@@ -400,20 +819,37 @@ def generate_csv_report(username: str, results: dict, csvfile):
                 results[site].get("url_user", ""),
                 status,
                 results[site].get("http_status", 0),
+                error_reason,
             ]
         )
+
+
+def _get_result_error_reason(result_status):
+    if not result_status:
+        return 'Unknown'
+
+    if result_status.error:
+        context = getattr(result_status.error, 'context', None)
+        if context:
+            return str(context)
+        return str(result_status.error)
+
+    if result_status.context:
+        return str(result_status.context)
+
+    if result_status.status == MaigretCheckStatus.UNKNOWN:
+        return 'Unknown'
+
+    return ''
 
 
 def generate_txt_report(username: str, results: dict, file):
     exists_counter = 0
     for website_name in results:
         dictionary = results[website_name]
-        # TODO: fix no site data issue
-        if not dictionary:
-            continue
         if (
             dictionary.get("status")
-            and dictionary["status"].status == QueryStatus.CLAIMED
+            and dictionary["status"].status == MaigretCheckStatus.CLAIMED
         ):
             exists_counter += 1
             file.write(dictionary["url_user"] + "\n")
@@ -426,11 +862,10 @@ def generate_json_report(username: str, results: dict, file, report_type):
 
     for sitename in results:
         site_result = results[sitename]
-        # TODO: fix no site data issue
-        if not site_result or not site_result.get("status"):
+        if not site_result.get("status"):
             continue
 
-        if site_result["status"].status != QueryStatus.CLAIMED:
+        if site_result["status"].status != MaigretCheckStatus.CLAIMED:
             continue
 
         data = dict(site_result)
@@ -451,8 +886,114 @@ def generate_json_report(username: str, results: dict, file, report_type):
 
 
 """
-XMIND 8 Functions
+XMIND Functions
 """
+
+
+_XMIND_MANIFEST_PATH = "META-INF/manifest.xml"
+_XMIND_MANIFEST_NAMESPACE = "urn:xmind:xmap:xmlns:manifest:1.0"
+_XMIND_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _xmind_member_media_type(name):
+    if name.endswith('/'):
+        return ''
+    if name.endswith('.xml'):
+        return 'text/xml'
+    if name.endswith('.json'):
+        return 'application/json'
+    return 'application/octet-stream'
+
+
+def _build_xmind_manifest(member_names):
+    ElementTree.register_namespace('', _XMIND_MANIFEST_NAMESPACE)
+    root = ElementTree.Element(
+        f'{{{_XMIND_MANIFEST_NAMESPACE}}}manifest', {'password-hint': ''}
+    )
+    for name in member_names:
+        ElementTree.SubElement(
+            root,
+            f'{{{_XMIND_MANIFEST_NAMESPACE}}}file-entry',
+            {
+                'full-path': name,
+                'media-type': _xmind_member_media_type(name),
+            },
+        )
+    return ElementTree.tostring(root, encoding='utf-8', xml_declaration=True)
+
+
+def _validate_xmind_archive(filename, expected_names):
+    with zipfile.ZipFile(filename) as archive:
+        invalid_member = archive.testzip()
+        if invalid_member is not None:
+            raise ValueError(f'Invalid XMind ZIP member: {invalid_member}')
+
+        names = archive.namelist()
+        if names != expected_names:
+            raise ValueError('Rewritten XMind archive has unexpected members')
+        if names.count(_XMIND_MANIFEST_PATH) != 1:
+            raise ValueError('Rewritten XMind archive must contain one manifest')
+
+        manifest = ElementTree.fromstring(archive.read(_XMIND_MANIFEST_PATH))
+        entry_tag = f'{{{_XMIND_MANIFEST_NAMESPACE}}}file-entry'
+        manifest_names = [
+            entry.attrib.get('full-path') for entry in manifest.findall(entry_tag)
+        ]
+        if manifest_names != expected_names:
+            raise ValueError('XMind manifest does not list every archive member')
+
+
+def _normalize_xmind_archive(filename):
+    """Atomically add the manifest required by current XMind readers."""
+    archive_path = os.fspath(filename)
+    archive_dir = os.path.dirname(os.path.abspath(archive_path))
+    archive_mode = os.stat(archive_path).st_mode & 0o7777
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(archive_path)}.',
+        suffix='.tmp',
+        dir=archive_dir,
+    )
+    os.close(temporary_fd)
+
+    try:
+        with zipfile.ZipFile(archive_path) as source:
+            members = [
+                member
+                for member in source.infolist()
+                if member.filename != _XMIND_MANIFEST_PATH
+            ]
+            expected_names = [member.filename for member in members]
+            expected_names.append(_XMIND_MANIFEST_PATH)
+            manifest = _build_xmind_manifest(expected_names)
+
+            with zipfile.ZipFile(temporary_path, mode='w') as target:
+                target.comment = source.comment
+                for member in members:
+                    target.writestr(member, source.read(member))
+
+                manifest_info = zipfile.ZipInfo(
+                    _XMIND_MANIFEST_PATH, date_time=_XMIND_ZIP_EPOCH
+                )
+                manifest_info.compress_type = zipfile.ZIP_DEFLATED
+                manifest_info.create_system = 3
+                manifest_info.external_attr = 0o100644 << 16
+                target.writestr(manifest_info, manifest)
+
+        # Flush through a writable handle, and before the chmod: Windows
+        # implements fsync as FlushFileBuffers, which needs write access and
+        # raises EBADF on a read-only handle. Doing it after the chmod would
+        # also fail to reopen the file at all when archive_mode is read-only.
+        with open(temporary_path, 'rb+') as temporary_file:
+            os.fsync(temporary_file.fileno())
+        os.chmod(temporary_path, archive_mode)
+        _validate_xmind_archive(temporary_path, expected_names)
+        os.replace(temporary_path, archive_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def save_xmind_report(filename, username, results):
@@ -462,6 +1003,7 @@ def save_xmind_report(filename, username, results):
     sheet = workbook.getPrimarySheet()
     design_xmind_sheet(sheet, username, results)
     xmind.save(workbook, path=filename)
+    _normalize_xmind_archive(filename)
 
 
 def add_xmind_subtopic(userlink, k, v, supposed_data):
@@ -474,8 +1016,8 @@ def add_xmind_subtopic(userlink, k, v, supposed_data):
 
 
 def design_xmind_sheet(sheet, username, results):
-    alltags = {}
-    supposed_data = {}
+    alltags: Dict[str, Any] = {}
+    supposed_data: Dict[str, Any] = {}
 
     sheet.setTitle("%s Analysis" % (username))
     root_topic1 = sheet.getRootTopic()
@@ -484,14 +1026,24 @@ def design_xmind_sheet(sheet, username, results):
     undefinedsection = root_topic1.addSubTopic()
     undefinedsection.setTitle("Undefined")
     alltags["undefined"] = undefinedsection
+    error_section = None
 
     for website_name in results:
         dictionary = results[website_name]
-        if not dictionary:
-            continue
         result_status = dictionary.get("status")
-        # TODO: fix the reason
-        if not result_status or result_status.status != QueryStatus.CLAIMED:
+        if not result_status or result_status.status != MaigretCheckStatus.CLAIMED:
+            error_reason = _get_result_error_reason(result_status)
+            if not error_reason:
+                continue
+
+            if error_section is None:
+                error_section = root_topic1.addSubTopic()
+                error_section.setTitle("Errors")
+
+            userlink = error_section.addSubTopic()
+            userlink.setTitle(f"{website_name}: {error_reason}")
+            if dictionary.get("url_user"):
+                userlink.addLabel(dictionary["url_user"])
             continue
 
         stripped_tags = list(map(lambda x: x.strip(), result_status.tags))
@@ -501,11 +1053,13 @@ def design_xmind_sheet(sheet, username, results):
 
         category = None
         for tag in normalized_tags:
-            if tag in alltags.keys():
-                continue
-            tagsection = root_topic1.addSubTopic()
-            tagsection.setTitle(tag)
-            alltags[tag] = tagsection
+            if tag not in alltags:
+                tagsection = root_topic1.addSubTopic()
+                tagsection.setTitle(tag)
+                alltags[tag] = tagsection
+            # A section created for an earlier site is still this site's section.
+            # Setting the category only when a section was created filed every
+            # site after the first one for a tag under "Undefined".
             category = tag
 
         section = alltags[category] if category else undefinedsection
